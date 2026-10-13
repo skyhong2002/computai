@@ -9304,6 +9304,20 @@ def tailscale_name(exe):
     return name or None
 
 
+def tailscale_serve_for(status, port):
+    """serve 設定裡已經把 / 轉到 127.0.0.1:<port> 的 HTTPS 埠（443、8443 或 10000）；沒有就是 None。"""
+    web = status.get("Web")
+    targets = ("http://127.0.0.1:%d" % port, "http://localhost:%d" % port)
+    mine = set()
+    for key, site in web.items() if isinstance(web, dict) else ():
+        handlers = site.get("Handlers") if isinstance(site, dict) else None
+        root = handlers.get("/") if isinstance(handlers, dict) else None
+        proxy = root.get("Proxy") if isinstance(root, dict) else None
+        if isinstance(key, str) and isinstance(proxy, str) and proxy.rstrip("/") in targets:
+            mine.add(key.rpartition(":")[2])
+    return next((p for p in (443, 8443, 10000) if str(p) in mine), None)
+
+
 def tailscale_open(port):
     """用 tailscale serve 把 127.0.0.1:<port> 安全地轉到 tailnet（HTTPS，只有自己 tailnet 裡的裝置連得到）。
     回傳 (網址, 名字, 關掉的函式)；沒有 tailscale 或沒登入時 SystemExit 並說明怎麼裝，不會改聽 0.0.0.0。"""
@@ -9322,15 +9336,18 @@ def tailscale_open(port):
     except (ValueError, TypeError):
         raise SystemExit("computai: cannot read tailscale serve configuration; existing services were left unchanged. "
                          "Check `tailscale serve status --json` and try again.")
+    # 上次沒關乾淨（被 SIGKILL、關機）留下的、已經轉到這個埠的 serve 就直接沿用，不然每次重啟都多佔一個埠
+    mine = tailscale_serve_for(status, port)
     free = [p for p in (443, 8443, 10000) if str(p) not in used]
-    if not free:
+    if not mine and not free:
         raise SystemExit("computai: tailscale serve already uses ports 443, 8443 and 10000 on this machine; "
                          "free one with `tailscale serve --https=PORT off`")
-    https = free[0]
-    err = []
-    run_cmd([exe, "serve", "--bg", "--https=%d" % https, str(int(port))], timeout=30, errors=err)
-    if err:
-        raise SystemExit("computai: tailscale serve failed: %s" % err[0])
+    https = mine or free[0]
+    if not mine:
+        err = []
+        run_cmd([exe, "serve", "--bg", "--https=%d" % https, str(int(port))], timeout=30, errors=err)
+        if err:
+            raise SystemExit("computai: tailscale serve failed: %s" % err[0])
     done = []
 
     def close():

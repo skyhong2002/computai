@@ -1,5 +1,7 @@
+import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -86,6 +88,40 @@ class Tailscale(unittest.TestCase):
         p.communicate(timeout=20)
         self.assertTrue(any(c.startswith("serve --bg --https=8443 ") for c in self.calls()), self.calls())
         self.assertEqual(self.calls()[-1], "serve --https=8443 off")
+
+    def test_reuses_a_serve_left_behind_for_the_same_port(self):
+        # 上次被 SIGKILL：8443 和 10000 都還轉到這個埠，443 是別的服務。沿用 8443，不再開新的
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        site = lambda target: {"Handlers": {"/": {"Proxy": target}}}
+        serve = json.dumps({"TCP": {"443": {"HTTPS": True}, "8443": {"HTTPS": True}, "10000": {"HTTPS": True}},
+                            "Web": {"box.tail1234.ts.net:443": site("http://127.0.0.1:3773"),
+                                    "box.tail1234.ts.net:8443": site("http://127.0.0.1:%d" % port),
+                                    "box.tail1234.ts.net:10000": site("http://127.0.0.1:%d" % port)}})
+        p = subprocess.Popen([sys.executable, helpers.SCRIPT, "--web", "127.0.0.1:%d" % port, "--tailscale",
+                              "-n", "60"], env=self.sb.env(**self.env(TS_SERVE=serve)),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out = ""
+        deadline = time.time() + 20
+        while time.time() < deadline and "ts.net" not in out:
+            out += p.stdout.readline()
+        p.terminate()
+        p.communicate(timeout=20)
+        self.assertIn("https://box.tail1234.ts.net:8443/", out)
+        self.assertFalse(any(c.startswith("serve --bg") for c in self.calls()), self.calls())
+        self.assertEqual(self.calls()[-1], "serve --https=8443 off")
+
+    def test_serve_for_only_matches_this_port(self):
+        m = helpers.load()
+        site = lambda target: {"Handlers": {"/": {"Proxy": target}}}
+        status = {"Web": {"a.ts.net:10000": site("http://127.0.0.1:8765"), "a.ts.net:443": site("http://127.0.0.1:3773"),
+                          "a.ts.net:8443": site("http://localhost:8765/")}}
+        self.assertEqual(m.tailscale_serve_for(status, 8765), 8443)
+        self.assertIsNone(m.tailscale_serve_for(status, 9999))
+        for bad in ({}, {"Web": []}, {"Web": {"a:443": None}}, {"Web": {"a:443": {"Handlers": {"/": "x"}}}}):
+            self.assertIsNone(m.tailscale_serve_for(bad, 8765))
 
     def test_without_tailscale_explains_and_never_opens_up(self):
         r = self.sb.run("--web", "127.0.0.1:0", "--tailscale", **self.env(with_ts=False))
